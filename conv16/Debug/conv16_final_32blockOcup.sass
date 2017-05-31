@@ -1,0 +1,534 @@
+# Kernel: conv_kernel_32
+# Arch: sm_50
+# InsCnt:
+# RegCnt: 5
+# SharedSize: 2176
+# BarCnt: 0
+# Params(3):
+#	ord:addr:size:align
+#	0:0x140:4:0
+#	1:0x144:4:0
+#	2:0x148:4:0
+#
+# Instructions:
+
+<CONSTANT_MAPPING>
+    blockDimX : c[0x0][0x8]
+    blockDimY : c[0x0][0xc]
+    blockDimZ : c[0x0][0x10]
+    gridDimX : c[0x0][0x14]
+    gridDimY : c[0x0][0x18]
+    gridDimZ : c[0x0][0x1c]
+
+    param_0 : c[0x0][0x140]
+    param_1 : c[0x0][0x144]
+    param_2 : c[0x0][0x148]
+</CONSTANT_MAPPING>
+
+<REGISTER_MAPPING>
+
+
+    0-15  : H<00-15>         //conv kernel: 1D N=16
+
+    16-31 : Xa<00-15>
+    36    : Xodd
+
+    44-59 : Ya<00-15>
+    17-31 : YaTemp<00-14>    //reuse Xa's reg and >>1 reg for avoiding 4 bank conflict of reg while caculating
+    16    : YaTemp15
+
+    32-35 : readXs,writeYg,writeYs,readYs
+
+    36-39 : readSxA<00-03>
+    40-43 : readSxB<00-03>
+
+    44-59 ~ readXg,readXgLast,writeXs,writeXsLast,tid,tid_m2,tid_3,tid_3m4,tid_15,tid_28,warp3,warp7,half_warp
+    36-43 ~ bx,bx_mul,bx_m11,readHg
+
+
+</REGISTER_MAPPING>
+
+--:-:1:-:1      S2R tid, SR_TID.X;                    // Set Dep 1
+--:-:2:-:1      S2R bx,  SR_CTAID.X;                  // Set Dep 2
+
+--:-:-:-:1      MOV writeXs, 0;
+--:-:-:-:1      MOV readHg, param_0;
+//--:-:-:-:1      MOV writeYg, param_2;
+//01:-:-:-:1      SHL tid_m2, tid, 2;                 //29*16 + tid*4
+//01:-:-:-:1      SHL tid_m4, tid, 4;                 //vec4 * 4 : 2^4=16bytes
+01:-:-:-:1      LOP.AND tid_3, tid, 3;                //for writeXs: in a 4-tid group        . get [0 1 2 3 ]
+--:-:-:-:1      LOP.AND tid_28, tid, 28;              //for writeXs: divid 4 tid as a group  . get [0 4 8 12 16 20 24 28]
+--:-:-:-:1      LOP.AND tid_15, tid, 15;              //for readXgLast:                      . get [0 1 2 3 ...15]
+--:-:-:-:1      LOP.AND half_warp, tid, 16;           //get [0 16]
+//base addr of block
+02:-:-:-:1      SHL bx_mul, bx, 11;                   //32*16*1 time >> 512 FP32 * 4bytes = 2048 !!! do not count the last 32 data
+
+//store 16 point 1-D conv kernel in 16 registers (each thread)
+--:-:1:-:1      LDG.128 H00, [readHg + 4x<4*0>];
+--:-:1:-:1      LDG.128 H04, [readHg + 4x<4*1>];
+--:-:1:-:1      LDG.128 H08, [readHg + 4x<4*2>];
+--:-:1:-:1      LDG.128 H12, [readHg + 4x<4*3>];
+
+
+//load X data from global mem
+//------------------------------------------------------------------------------------------------------------------
+
+//readXgLast
+//32*16*4 + (tid) * 4bytes  full-warp
+--:-:-:-:6      ISCADD readXgLast, tid, 2048, 2;      //tid<<2 + 2048  // (pre 512 FP32 = 2048bytes) + (1 FP32 per thread)
+--:-:-:-:6      IADD readXgLast, readXgLast, param_1; //+base addr_X
+--:-:-:-:1      IADD readXgLast, readXgLast, bx_mul;  //+base addr_block
+
+//readXg
+--:-:-:-:6      ISCADD readXg, tid, bx_mul, 4;        //vec4 : 4 FP32 * 4byte = tid<<4  + base addr_block
+--:-:-:-:6      IADD readXg, readXg, param_1;         //+base addr_X
+
+
+//vec4 load from X 32*vec4*4bytes=128bytes * (0 1 2 3)
+--:-:2:-:1      LDG.128 Xa00, [readXg + 4x<128*0>];   //+32threads*vec4*4bytes = + 128*4 bytes space ench time
+--:-:2:-:1      LDG.128 Xa04, [readXg + 4x<128*1>];
+--:-:2:-:1      LDG.128 Xa08, [readXg + 4x<128*2>];
+--:-:2:-:1      LDG.128 Xa12, [readXg + 4x<128*3>];
+//read 32 more data at end for calculate Y ( only 1/4 of these data are useful)
+--:-:2:-:1      LDG Xodd, [readXgLast];
+
+
+
+//store X data to shared mem (see 'pic_X_in_Shared.png' for details of storage structure)
+//------------------------------------------------------------------------------------------------------------------
+
+//writeXsLast
+//32*4*4*(0 1 2 3) + tid_3 * 4
+//no! that should be 8*vec4*4times*4bytes*(0 1 2 3) + tid_3 * 4
+--:-:-:-:6      SHL tid_3m4, tid_3, 2;                //get [0 4 8 12] for each 4-thread goup
+--:-:-:-:6      SHR warp7, tid_28, 2;                 //get [0 1 2 3 4 5 6 7]
+--:-:-:-:6      LOP.AND warp3, warp7, 3;              //get [0 1 2 3 0 1 2 3]
+--:-:-:-:d      XMAD warp3, warp3, 544, RZ;           //(128+8)*4=544
+//--:-:-:-:6      ISCADD writeXsLast, warp3, tid_3m4, 9; //to the point //+512*[0 1 2 3]
+--:-:-:-:6      MOV writeXsLast, warp3;
+--:-:-:-:6      IADD writeXsLast, writeXsLast, tid_3m4;
+--:-:-:-:6      IADD writeXsLast, writeXsLast, half_warp;
+--:-:-:-:6      IADD writeXsLast, writeXsLast, 512;
+
+//writeXs
+//base tid_addr 33*4*4*(tid&3)
+//[0 4 8...][1 5 9...][2 6 10...][3 7 11...]
+//--:-:-:-:6      SHL writeXs, tid_3, 9;              //512=32*4FP32*4bytes // no!no!no!+ 4FP32*4bytes
+--:-:-:-:d      XMAD writeXs, tid_3, 544, RZ;         //512+32=32*4FP32*4bytes + 8FP32*4bytes yes!yes!
+//--:-:-:-:6      IMUL.U32 writeXs, tid_3, 528;       //33*4*4   !!33!!
+--:-:-:-:6      ISCADD writeXs, warp7, writeXs, 4;    //+warp7*4*4bytes
+
+//+8*vec4*4 space ench time
+03:-:-:-:1      STS.128 [writeXs + 4x<32*0>], Xa00;   // Wait Dep 1
+--:1:-:-:1      STS.128 [writeXs + 4x<32*1>], Xa04;   // Wait Dep 2
+--:1:-:-:1      STS.128 [writeXs + 4x<32*2>], Xa08;   // Wait Dep 3
+--:1:-:-:1      STS.128 [writeXs + 4x<32*3>], Xa12;   // Wait Dep 4
+--:2:-:-:1      STS [writeXsLast], Xodd;              // Wait Dep 5
+//512*4 + 32*4 = 2176 bytes SM space total.
+
+
+//read one vec4 from SM
+--:-:-:-:6      SHL readXs, tid, 4;                   //vec4 : tid*4*4
+
+//writeYs reuse X space in SM
+//16*4bytes=64 , 64*32 = 2048
+--:-:-:-:1      SHL writeYs, tid, 6;    //64=2^6
+
+//readYs from SM
+//then [readYs + 4x<128 * (0 1 2 3)>] 4*32=128
+--:-:-:-:1      SHL readYs, tid, 4;     //16=2^4
+
+//writeYg to GM
+//32*16*1times=512 512*4bytes=2048
+//bx*2048 + tid * 16bytes
+//little cycle: writeYg + 4x<128*0/1/2/3>
+//big cycle: writeYg += 512*4 = 2048
+
+--:-:-:-:6      SHL bx_m11, bx, 11;             //bx*2048bytes
+--:-:-:-:6      ISCADD writeYg, tid, bx_m11, 4; //+tid*16+base block_addr
+--:-:-:-:6      IADD writeYg, writeYg, param_2; //+base addr
+//--:-:-:-:6      IADD writeYg, writeYg, -2048;   //? see the later 6 line code
+
+//---------NO CALCU LOOP--------
+03:-:-:-:1      MOV Ya00, 0;
+--:-:-:-:1      MOV Ya01, 0;
+--:-:1:-:1      LDS.U.128 readSxA00, [readXs];        //+33*4*4 each line
+--:-:-:-:1      MOV Ya02, 0;
+--:-:-:-:1      MOV Ya03, 0;
+--:-:-:-:1      MOV Ya04, 0;
+--:-:-:-:1      MOV Ya05, 0;
+--:-:-:-:1      MOV Ya06, 0;
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<136*1>];//32*4+4
+--:-:-:-:1      MOV Ya07, 0;
+--:-:-:-:1      MOV Ya08, 0;
+--:-:-:-:1      MOV Ya09, 0;
+--:-:-:-:1      MOV Ya10, 0;
+--:-:-:-:1      MOV Ya11, 0;
+--:-:-:-:1      MOV Ya12, 0;
+--:-:-:-:1      MOV Ya13, 0;
+--:-:-:-:1      MOV Ya14, 0;
+--:-:-:-:1      MOV Ya15, 0;
+
+//calcu Y
+//1
+01:-:-:-:1      FMUL YaTemp00, readSxA03.reuse, H12;
+--:-:-:-:1      FMUL YaTemp01, readSxA03.reuse, H13;
+--:-:-:-:1      FMUL YaTemp02, readSxA03.reuse, H14;
+--:-:-:-:1      FMUL YaTemp03, readSxA03, H15;
+
+--:-:-:-:1      MOV YaTemp04, 0;
+--:-:-:-:1      MOV YaTemp05, 0;
+--:-:-:-:1      MOV YaTemp06, 0;
+--:-:-:-:1      MOV YaTemp07, 0;
+--:-:-:-:1      MOV YaTemp08, 0;
+--:-:-:-:1      MOV YaTemp09, 0;
+--:-:-:-:1      MOV YaTemp10, 0;
+--:-:-:-:1      MOV YaTemp11, 0;
+--:-:-:-:1      MOV YaTemp12, 0;
+--:-:-:-:1      MOV YaTemp13, 0;
+--:-:-:-:1      MOV YaTemp14, 0;
+--:-:-:-:1      MOV YaTemp15, 0;
+
+--:-:-:-:1      FFMA Ya00, readSxA02.reuse, H13, Ya00;
+--:-:-:-:1      FFMA Ya01, readSxA02.reuse, H14, Ya01;
+--:-:-:-:4      FFMA Ya02, readSxA02, H15, Ya02;
+
+--:-:-:-:1      FFMA Ya00, readSxA01.reuse, H14, Ya00;
+--:-:-:-:1      FFMA Ya01, readSxA01, H15, Ya01;
+
+--:-:-:-:6      FFMA YaTemp00, readSxA00, H15, YaTemp00;
+
+--:-:1:-:1      LDS.U.128 readSxA00, [readXs + 4x<136*2>];  //+33*4*4 each line
+
+//2
+02:-:-:-:1      FFMA YaTemp00, readSxB03.reuse, H08, YaTemp00;
+--:-:-:-:1      FFMA YaTemp01, readSxB03.reuse, H09, YaTemp01;
+--:-:-:-:1      FFMA YaTemp02, readSxB03.reuse, H10, YaTemp02;
+--:-:-:-:1      FFMA YaTemp03, readSxB03.reuse, H11, YaTemp03;
+--:-:-:-:1      FFMA YaTemp04, readSxB03.reuse, H12, YaTemp04;
+--:-:-:-:1      FFMA YaTemp05, readSxB03.reuse, H13, YaTemp05;
+--:-:-:-:1      FFMA YaTemp06, readSxB03.reuse, H14, YaTemp06;
+--:-:-:-:1      FFMA YaTemp07, readSxB03, H15, YaTemp07;
+
+--:-:-:-:1      FFMA Ya00, readSxB02.reuse, H09, Ya00;
+--:-:-:-:1      FFMA Ya01, readSxB02.reuse, H10, Ya01;
+--:-:-:-:1      FFMA Ya02, readSxB02.reuse, H11, Ya02;
+--:-:-:-:1      FFMA Ya03, readSxB02.reuse, H12, Ya03;
+--:-:-:-:1      FFMA Ya04, readSxB02.reuse, H13, Ya04;
+--:-:-:-:1      FFMA Ya05, readSxB02.reuse, H14, Ya05;
+--:-:-:-:1      FFMA Ya06, readSxB02, H15, Ya06;
+
+--:-:-:-:1      FFMA Ya00, readSxB01.reuse, H10, Ya00;//0 1 2
+--:-:-:-:1      FFMA Ya01, readSxB01.reuse, H11, Ya01;
+--:-:-:-:1      FFMA Ya02, readSxB01.reuse, H12, Ya02;
+--:-:-:-:1      FFMA Ya03, readSxB01.reuse, H13, Ya03;
+--:-:-:-:1      FFMA Ya04, readSxB01.reuse, H14, Ya04;
+--:-:-:-:3      FFMA Ya05, readSxB01, H15, Ya05;
+
+--:-:-:-:1      FFMA Ya02, readSxB00.reuse, H13, Ya02;//2 0 1
+--:-:-:-:1      FFMA Ya00, readSxB00.reuse, H11, Ya00;//0 0 3
+--:-:-:-:1      FFMA Ya01, readSxB00.reuse, H12, Ya01;//1 0 0
+--:-:-:-:1      FFMA Ya03, readSxB00.reuse, H14, Ya03;//3 0 2
+--:-:-:-:1      FFMA Ya04, readSxB00, H15, Ya04;//0 0 3
+
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<136*3>];  //+33*4*4 each line
+
+//3
+01:-:-:-:1      FFMA YaTemp00, readSxA03.reuse, H04, YaTemp00;
+--:-:-:-:1      FFMA YaTemp01, readSxA03.reuse, H05, YaTemp01;
+--:-:-:-:1      FFMA YaTemp02, readSxA03.reuse, H06, YaTemp02;
+--:-:-:-:1      FFMA YaTemp03, readSxA03.reuse, H07, YaTemp03;
+--:-:-:-:1      FFMA YaTemp04, readSxA03.reuse, H08, YaTemp04;
+--:-:-:-:1      FFMA YaTemp05, readSxA03.reuse, H09, YaTemp05;
+--:-:-:-:1      FFMA YaTemp06, readSxA03.reuse, H10, YaTemp06;
+--:-:-:-:1      FFMA YaTemp07, readSxA03.reuse, H11, YaTemp07;
+--:-:-:-:1      FFMA YaTemp08, readSxA03.reuse, H12, YaTemp08;
+--:-:-:-:1      FFMA YaTemp09, readSxA03.reuse, H13, YaTemp09;
+--:-:-:-:1      FFMA YaTemp10, readSxA03.reuse, H14, YaTemp10;
+--:-:-:-:1      FFMA YaTemp11, readSxA03, H15, YaTemp11;
+
+--:-:-:-:1      FFMA Ya00, readSxA02.reuse, H05, Ya00;//0 2  1
+--:-:-:-:1      FFMA Ya01, readSxA02.reuse, H06, Ya01;//1 2. 2
+--:-:-:-:1      FFMA Ya02, readSxA02.reuse, H07, Ya02;//2 2. 3
+--:-:-:-:1      FFMA Ya03, readSxA02.reuse, H08, Ya03;//3 2. 0
+--:-:-:-:1      FFMA Ya04, readSxA02.reuse, H09, Ya04;//0 2. 1
+--:-:-:-:1      FFMA Ya05, readSxA02.reuse, H10, Ya05;//1 2. 2
+--:-:-:-:1      FFMA Ya06, readSxA02.reuse, H11, Ya06;//2 2. 3
+--:-:-:-:1      FFMA Ya07, readSxA02.reuse, H12, Ya07;//3 2. 0
+--:-:-:-:1      FFMA Ya08, readSxA02.reuse, H13, Ya08;//0 2. 1
+--:-:-:-:1      FFMA Ya09, readSxA02.reuse, H14, Ya09;//1 2. 2
+--:-:-:-:1      FFMA Ya10, readSxA02, H15, Ya10;      //2 2. 3
+
+--:-:-:-:1      FFMA Ya00, readSxA01.reuse, H06, Ya00;//0 1 2
+--:-:-:-:1      FFMA Ya01, readSxA01.reuse, H07, Ya01;//1 1. 3
+--:-:-:-:1      FFMA Ya02, readSxA01.reuse, H08, Ya02;//2 1. 0
+--:-:-:-:1      FFMA Ya03, readSxA01.reuse, H09, Ya03;//3 1. 1
+--:-:-:-:1      FFMA Ya04, readSxA01.reuse, H10, Ya04;//0 1. 2
+--:-:-:-:1      FFMA Ya05, readSxA01.reuse, H11, Ya05;//1 1. 3
+--:-:-:-:1      FFMA Ya06, readSxA01.reuse, H12, Ya06;//2 1. 0
+--:-:-:-:1      FFMA Ya07, readSxA01.reuse, H13, Ya07;//3 1. 1
+--:-:-:-:1      FFMA Ya08, readSxA01.reuse, H14, Ya08;//0 1. 2
+--:-:-:-:1      FFMA Ya09, readSxA01, H15, Ya09;      //1 1. 3
+
+--:-:-:-:1      FFMA Ya02, readSxA00.reuse, H09, Ya02;//2 0  1
+--:-:-:-:1      FFMA Ya00, readSxA00.reuse, H07, Ya00;//0 0. 3
+--:-:-:-:1      FFMA Ya01, readSxA00.reuse, H08, Ya01;//1 0. 0
+--:-:-:-:1      FFMA Ya03, readSxA00.reuse, H10, Ya03;//3 0. 2
+--:-:-:-:1      FFMA Ya04, readSxA00.reuse, H11, Ya04;//0 0. 3
+--:-:-:-:1      FFMA Ya05, readSxA00.reuse, H12, Ya05;//1 0. 0
+--:-:-:-:1      FFMA Ya06, readSxA00.reuse, H13, Ya06;//2 0. 1
+--:-:-:-:1      FFMA Ya07, readSxA00.reuse, H14, Ya07;//3 0. 2
+--:-:-:-:1      FFMA Ya08, readSxA00, H15, Ya08;      //0 0. 3
+
+//4
+02:-:-:-:1      IADD readXs, readXs, 16;
+--:-:-:-:1      FFMA YaTemp00, readSxB03.reuse, H00, YaTemp00;// 1 3  0
+--:-:-:-:1      FFMA YaTemp01, readSxB03.reuse, H01, YaTemp01;// 2 3. 1
+--:-:-:-:1      FFMA YaTemp02, readSxB03.reuse, H02, YaTemp02;// 3 3. 2
+--:-:-:-:1      FFMA YaTemp03, readSxB03.reuse, H03, YaTemp03;// 0 3. 3
+--:-:-:-:1      FFMA YaTemp04, readSxB03.reuse, H04, YaTemp04;
+--:-:-:-:1      FFMA YaTemp05, readSxB03.reuse, H05, YaTemp05;
+--:-:1:-:1      LDS.U.128 readSxA00, [readXs + 4x<136*0>];  //+33*4*4 each line
+--:-:-:-:1      FFMA YaTemp06, readSxB03.reuse, H06, YaTemp06;
+--:-:-:-:1      FFMA YaTemp07, readSxB03.reuse, H07, YaTemp07;
+--:-:-:-:1      FFMA YaTemp08, readSxB03.reuse, H08, YaTemp08;
+--:-:-:-:1      FFMA YaTemp09, readSxB03.reuse, H09, YaTemp09;
+--:-:-:-:1      FFMA YaTemp10, readSxB03.reuse, H10, YaTemp10;
+--:-:-:-:1      FFMA YaTemp11, readSxB03.reuse, H11, YaTemp11;
+--:-:-:-:1      FFMA YaTemp12, readSxB03.reuse, H12, YaTemp12;
+--:-:-:-:1      FFMA YaTemp13, readSxB03.reuse, H13, YaTemp13;
+--:-:-:-:1      FFMA YaTemp14, readSxB03.reuse, H14, YaTemp14;
+--:-:-:-:1      FFMA YaTemp15, readSxB03, H15, YaTemp15;
+
+--:-:-:-:1      FFMA Ya00, readSxB02.reuse, H01, Ya00;//0 2  1
+--:-:-:-:1      FFMA Ya01, readSxB02.reuse, H02, Ya01;//1 2. 2
+--:-:-:-:1      FFMA Ya02, readSxB02.reuse, H03, Ya02;//2 2. 3
+--:-:-:-:1      FFMA Ya03, readSxB02.reuse, H04, Ya03;//3 2. 0
+--:-:-:-:1      FFMA Ya04, readSxB02.reuse, H05, Ya04;//0 2. 1
+--:-:-:-:1      FFMA Ya05, readSxB02.reuse, H06, Ya05;//1 2. 2
+--:-:-:-:1      FFMA Ya06, readSxB02.reuse, H07, Ya06;//2 2. 3
+--:-:-:-:1      FFMA Ya07, readSxB02.reuse, H08, Ya07;//3 2. 0
+--:-:-:-:1      FFMA Ya08, readSxB02.reuse, H09, Ya08;//0 2. 1
+--:-:-:-:1      FFMA Ya09, readSxB02.reuse, H10, Ya09;//1 2. 2
+--:-:-:-:1      FFMA Ya10, readSxB02.reuse, H11, Ya10;//2 2. 3
+--:-:-:-:1      FFMA Ya11, readSxB02.reuse, H12, Ya11;//3 2. 0
+--:-:-:-:1      FFMA Ya12, readSxB02.reuse, H13, Ya12;//0 2. 1
+--:-:-:-:1      FFMA Ya13, readSxB02.reuse, H14, Ya13;//1 2. 2
+--:-:-:-:1      FFMA Ya14, readSxB02, H15, Ya14;      //2 2. 3
+
+--:-:-:-:1      FFMA Ya00, readSxB01.reuse, H02, Ya00;//0 1  2
+--:-:-:-:1      FFMA Ya01, readSxB01.reuse, H03, Ya01;//1 1. 3
+--:-:-:-:1      FFMA Ya02, readSxB01.reuse, H04, Ya02;//2 1. 0
+--:-:-:-:1      FFMA Ya03, readSxB01.reuse, H05, Ya03;//3 1. 1
+--:-:-:-:1      FFMA Ya04, readSxB01.reuse, H06, Ya04;//0 1. 2
+--:-:-:-:1      FFMA Ya05, readSxB01.reuse, H07, Ya05;//1 1. 3
+--:-:-:-:1      FFMA Ya06, readSxB01.reuse, H08, Ya06;//2 1. 0
+--:-:-:-:1      FFMA Ya07, readSxB01.reuse, H09, Ya07;//3 1. 1
+--:-:-:-:1      FFMA Ya08, readSxB01.reuse, H10, Ya08;//0 1. 2
+--:-:-:-:1      FFMA Ya09, readSxB01.reuse, H11, Ya09;//1 1. 3
+--:-:-:-:1      FFMA Ya10, readSxB01.reuse, H12, Ya10;//2 1. 0
+--:-:-:-:1      FFMA Ya11, readSxB01.reuse, H13, Ya11;//3 1. 1
+--:-:-:-:1      FFMA Ya12, readSxB01.reuse, H14, Ya12;//0 1. 2
+--:-:-:-:1      FFMA Ya13, readSxB01, H15, Ya13;      //1 1. 3
+
+--:-:-:-:1      FFMA Ya02, readSxB00.reuse, H05, Ya02;//2 0. 1
+--:-:-:-:1      FFMA Ya00, readSxB00.reuse, H03, Ya00;//0 0. 3
+--:-:-:-:1      FFMA Ya01, readSxB00.reuse, H04, Ya01;//1 0. 0
+--:-:-:-:1      FFMA Ya03, readSxB00.reuse, H06, Ya03;//3 0. 2
+--:-:-:-:1      FFMA Ya04, readSxB00.reuse, H07, Ya04;//0 0. 3
+--:-:-:-:1      FFMA Ya05, readSxB00.reuse, H08, Ya05;//1 0. 0
+--:-:-:-:1      FFMA Ya06, readSxB00.reuse, H09, Ya06;//2 0. 1
+--:-:-:-:1      FFMA Ya07, readSxB00.reuse, H10, Ya07;//3 0. 2
+--:-:-:-:1      FFMA Ya08, readSxB00.reuse, H11, Ya08;//0 0. 3
+--:-:-:-:1      FFMA Ya09, readSxB00.reuse, H12, Ya09;//1 0. 0
+--:-:-:-:1      FFMA Ya10, readSxB00.reuse, H13, Ya10;//2 0. 1
+--:-:-:-:1      FFMA Ya11, readSxB00.reuse, H14, Ya11;//3 0. 2
+--:-:-:-:1      FFMA Ya12, readSxB00, H15, Ya12;      //0 0. 3
+
+//5
+01:-:-:-:1      FFMA YaTemp04, readSxA03.reuse, H00, YaTemp04; //1 3  0
+--:-:-:-:1      FFMA YaTemp05, readSxA03.reuse, H01, YaTemp05; //2 3. 1
+--:-:-:-:1      FFMA YaTemp06, readSxA03.reuse, H02, YaTemp06;
+--:-:-:-:1      FFMA YaTemp07, readSxA03.reuse, H03, YaTemp07;
+--:-:-:-:1      FFMA YaTemp08, readSxA03.reuse, H04, YaTemp08;
+--:-:-:-:1      FFMA YaTemp09, readSxA03.reuse, H05, YaTemp09;
+--:-:-:-:1      FFMA YaTemp10, readSxA03.reuse, H06, YaTemp10;
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<136*1>];  //+33*4*4 each line
+--:-:-:-:1      FFMA YaTemp11, readSxA03.reuse, H07, YaTemp11;
+--:-:-:-:1      FFMA YaTemp12, readSxA03.reuse, H08, YaTemp12;
+--:-:-:-:1      FFMA YaTemp13, readSxA03.reuse, H09, YaTemp13;
+--:-:-:-:1      FFMA YaTemp14, readSxA03.reuse, H10, YaTemp14;
+--:-:-:-:1      FFMA YaTemp15, readSxA03, H11, YaTemp15;
+
+--:-:-:-:1      FFMA Ya03, readSxA02.reuse, H00, Ya03;//3 2  0
+--:-:-:-:1      FFMA Ya04, readSxA02.reuse, H01, Ya04;//0 2. 1
+--:-:-:-:1      FFMA Ya05, readSxA02.reuse, H02, Ya05;//1 2. 2
+--:-:-:-:1      FFMA Ya06, readSxA02.reuse, H03, Ya06;//2 2. 3
+--:-:-:-:1      FFMA Ya07, readSxA02.reuse, H04, Ya07;//3 2. 0
+--:-:-:-:1      FFMA Ya08, readSxA02.reuse, H05, Ya08;//0 2. 1
+--:-:-:-:1      FFMA Ya09, readSxA02.reuse, H06, Ya09;//1 2. 2
+--:-:-:-:1      FFMA Ya10, readSxA02.reuse, H07, Ya10;//2 2. 3
+--:-:-:-:1      FFMA Ya11, readSxA02.reuse, H08, Ya11;//3 2. 0
+--:-:-:-:1      FFMA Ya12, readSxA02.reuse, H09, Ya12;//0 2. 1
+--:-:-:-:1      FFMA Ya13, readSxA02.reuse, H10, Ya13;//1 2. 2
+--:-:-:-:1      FFMA Ya14, readSxA02.reuse, H11, Ya14;//2 2. 3
+--:-:-:-:1      FFMA Ya15, readSxA02, H12, Ya15;      //3 2. 0
+
+--:-:-:-:1      FFMA Ya02, readSxA01.reuse, H00, Ya02;//2 1  0
+--:-:-:-:1      FFMA Ya03, readSxA01.reuse, H01, Ya03;//3 1. 1
+--:-:-:-:1      FFMA Ya04, readSxA01.reuse, H02, Ya04;//0 1. 2
+--:-:-:-:1      FFMA Ya05, readSxA01.reuse, H03, Ya05;//1 1. 3
+--:-:-:-:1      FFMA Ya06, readSxA01.reuse, H04, Ya06;//2 1. 0
+--:-:-:-:1      FFMA Ya07, readSxA01.reuse, H05, Ya07;//3 1. 1
+--:-:-:-:1      FFMA Ya08, readSxA01.reuse, H06, Ya08;//0 1. 2
+--:-:-:-:1      FFMA Ya09, readSxA01.reuse, H07, Ya09;//1 1. 3
+--:-:-:-:1      FFMA Ya10, readSxA01.reuse, H08, Ya10;//2 1. 0
+--:-:-:-:1      FFMA Ya11, readSxA01.reuse, H09, Ya11;//3 1. 1
+--:-:-:-:1      FFMA Ya12, readSxA01.reuse, H10, Ya12;//0 1. 2
+--:-:-:-:1      FFMA Ya13, readSxA01.reuse, H11, Ya13;//1 1. 3
+--:-:-:-:1      FFMA Ya14, readSxA01.reuse, H12, Ya14;//2 1. 0
+--:-:-:-:1      FFMA Ya15, readSxA01, H13, Ya15;      //3 1. 1
+
+--:-:-:-:1      FFMA Ya03, readSxA00.reuse, H02, Ya03;//3 1  2
+--:-:-:-:1      FFMA Ya01, readSxA00.reuse, H00, Ya01;//1 1. 0
+--:-:-:-:1      FFMA Ya02, readSxA00.reuse, H01, Ya02;//2 1. 1
+--:-:-:-:1      FFMA Ya04, readSxA00.reuse, H03, Ya04;//0 1. 3
+--:-:-:-:1      FFMA Ya05, readSxA00.reuse, H04, Ya05;//1 1. 0
+--:-:-:-:1      FFMA Ya06, readSxA00.reuse, H05, Ya06;//2 1. 1
+--:-:-:-:1      FFMA Ya07, readSxA00.reuse, H06, Ya07;//3 1. 2
+--:-:-:-:1      FFMA Ya08, readSxA00.reuse, H07, Ya08;//0 1. 3
+--:-:-:-:1      FFMA Ya09, readSxA00.reuse, H08, Ya09;//1 1. 0
+--:-:-:-:1      FFMA Ya10, readSxA00.reuse, H09, Ya10;//2 1. 1
+--:-:-:-:1      FFMA Ya11, readSxA00.reuse, H10, Ya11;//3 1. 2
+--:-:-:-:1      FFMA Ya12, readSxA00.reuse, H11, Ya12;//0 1. 3
+--:-:-:-:1      FFMA Ya13, readSxA00.reuse, H12, Ya13;//1 1. 0
+--:-:-:-:1      FFMA Ya14, readSxA00.reuse, H13, Ya14;//2 1. 1
+--:-:-:-:1      FFMA Ya15, readSxA00, H14, Ya15;      //3 1. 2
+
+//6
+02:-:-:-:1      FFMA YaTemp08, readSxB03.reuse, H00, YaTemp08;
+--:-:-:-:1      FFMA YaTemp09, readSxB03.reuse, H01, YaTemp09;
+--:-:-:-:1      FFMA YaTemp10, readSxB03.reuse, H02, YaTemp10;
+--:-:-:-:1      FFMA YaTemp11, readSxB03.reuse, H03, YaTemp11;
+--:-:-:-:1      FFMA YaTemp12, readSxB03.reuse, H04, YaTemp12;
+--:-:-:-:1      FFMA YaTemp13, readSxB03.reuse, H05, YaTemp13;
+--:-:1:-:1      LDS.U.128 readSxA00, [readXs + 4x<136*2>];  //+33*4*4 each line
+--:-:-:-:1      FFMA YaTemp14, readSxB03.reuse, H06, YaTemp14;
+--:-:-:-:1      FFMA YaTemp15, readSxB03, H07, YaTemp15;
+
+--:-:-:-:1      FFMA Ya07, readSxB02.reuse, H00, Ya07;//3 2. 0
+--:-:-:-:1      FFMA Ya08, readSxB02.reuse, H01, Ya08;//0 2. 1
+--:-:-:-:1      FFMA Ya09, readSxB02.reuse, H02, Ya09;//1 2. 2
+--:-:-:-:1      FFMA Ya10, readSxB02.reuse, H03, Ya10;//2 2. 3
+--:-:-:-:1      FFMA Ya11, readSxB02.reuse, H04, Ya11;//3 2. 0
+--:-:-:-:1      FFMA Ya12, readSxB02.reuse, H05, Ya12;//0 2. 1
+--:-:-:-:1      FFMA Ya13, readSxB02.reuse, H06, Ya13;//1 2. 2
+--:-:-:-:1      FFMA Ya14, readSxB02.reuse, H07, Ya14;//2 2. 3
+--:-:-:-:1      FFMA Ya15, readSxB02, H08, Ya15;      //3 2. 0
+
+--:-:-:-:1      FFMA Ya06, readSxB01.reuse, H00, Ya06;//2 1. 0
+--:-:-:-:1      FFMA Ya07, readSxB01.reuse, H01, Ya07;//3 1. 1
+--:-:-:-:1      FFMA Ya08, readSxB01.reuse, H02, Ya08;//0 1. 2
+--:-:-:-:1      FFMA Ya09, readSxB01.reuse, H03, Ya09;//1 1. 3
+--:-:-:-:1      FFMA Ya10, readSxB01.reuse, H04, Ya10;//2 1. 0
+--:-:-:-:1      FFMA Ya11, readSxB01.reuse, H05, Ya11;//3 1. 1
+--:-:-:-:1      FFMA Ya12, readSxB01.reuse, H06, Ya12;//0 1. 2
+--:-:-:-:1      FFMA Ya13, readSxB01.reuse, H07, Ya13;//1 1. 3
+--:-:-:-:1      FFMA Ya14, readSxB01.reuse, H08, Ya14;//2 1. 0
+--:-:-:-:1      FFMA Ya15, readSxB01, H09, Ya15;      //3 1. 1
+
+--:-:-:-:1      FFMA Ya07, readSxB00.reuse, H02, Ya07;//3 0  2
+--:-:-:-:1      FFMA Ya05, readSxB00.reuse, H00, Ya05;//1 0. 0
+--:-:-:-:1      FFMA Ya06, readSxB00.reuse, H01, Ya06;//2 0. 1
+--:-:-:-:1      FFMA Ya08, readSxB00.reuse, H03, Ya08;//0 0. 3
+--:-:-:-:1      FFMA Ya09, readSxB00.reuse, H04, Ya09;//1 0. 0
+--:-:-:-:1      FFMA Ya10, readSxB00.reuse, H05, Ya10;//2 0. 1
+--:-:-:-:1      FFMA Ya11, readSxB00.reuse, H06, Ya11;//3 0. 2
+--:-:-:-:1      FFMA Ya12, readSxB00.reuse, H07, Ya12;//0 0. 3
+--:-:-:-:1      FFMA Ya13, readSxB00.reuse, H08, Ya13;//1 0. 0
+--:-:-:-:1      FFMA Ya14, readSxB00.reuse, H09, Ya14;//2 0. 1
+--:-:-:-:1      FFMA Ya15, readSxB00, H10, Ya15;      //3 0. 2
+
+//7
+01:-:-:-:1      FFMA YaTemp12, readSxA03.reuse, H00, YaTemp12;
+--:-:-:-:1      FFMA YaTemp13, readSxA03.reuse, H01, YaTemp13;
+--:-:-:-:1      FFMA YaTemp14, readSxA03.reuse, H02, YaTemp14;
+--:-:-:-:2      FFMA YaTemp15, readSxA03, H03, YaTemp15;
+
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<136*3>];  //+33*4*4 each line
+
+--:-:-:-:1      FFMA Ya11, readSxA02.reuse, H00, Ya11;//3 2. 0
+--:-:-:-:1      FFMA Ya12, readSxA02.reuse, H01, Ya12;//0 2. 1
+--:-:-:-:1      FFMA Ya13, readSxA02.reuse, H02, Ya13;//1 2. 2
+--:-:-:-:1      FFMA Ya14, readSxA02.reuse, H03, Ya14;//2 2. 3
+--:-:-:-:1      FFMA Ya15, readSxA02, H04, Ya15;      //3 2. 0
+
+--:-:-:-:1      FFMA Ya10, readSxA01.reuse, H00, Ya10;//2 1. 0
+--:-:-:-:1      FFMA Ya11, readSxA01.reuse, H01, Ya11;//3 1. 1
+--:-:-:-:1      FFMA Ya12, readSxA01.reuse, H02, Ya12;//0 1. 2
+--:-:-:-:1      FFMA Ya13, readSxA01.reuse, H03, Ya13;//1 1. 3
+--:-:-:-:1      FFMA Ya14, readSxA01.reuse, H04, Ya14;//2 1. 0
+--:-:-:-:1      FFMA Ya15, readSxA01, H05, Ya15;      //3 1. 1
+
+--:-:-:-:1      FFMA Ya10, readSxA00.reuse, H01, Ya10;//2 0. 1
+--:-:-:-:1      FFMA Ya09, readSxA00.reuse, H00, Ya09;//1 0. 0
+--:-:-:-:1      FFMA Ya11, readSxA00.reuse, H02, Ya11;//3 0. 2
+--:-:-:-:1      FFMA Ya12, readSxA00.reuse, H03, Ya12;//0 0. 3
+--:-:-:-:1      FFMA Ya13, readSxA00.reuse, H04, Ya13;//1 0. 0
+--:-:-:-:1      FFMA Ya14, readSxA00.reuse, H05, Ya14;//2 0. 1
+--:-:-:-:1      FFMA Ya15, readSxA00, H06, Ya15;      //3 0. 2
+
+--:-:-:-:1      FADD Ya00, Ya00, YaTemp00;
+--:-:-:-:1      FADD Ya01, Ya01, YaTemp01;
+--:-:-:-:1      FADD Ya02, Ya02, YaTemp02;
+--:-:-:-:1      FADD Ya03, Ya03, YaTemp03;
+--:-:-:-:1      FADD Ya04, Ya04, YaTemp04;
+
+
+//8
+02:-:-:-:1      FFMA Ya15, readSxB00.reuse, H02, Ya15;//3 0  2
+--:-:-:-:1      FFMA Ya13, readSxB00.reuse, H00, Ya13;//1 0. 0
+--:-:-:-:1      FFMA Ya14, readSxB00, H01, Ya14;      //2 0. 1
+
+--:-:-:-:1      FADD Ya05, Ya05, YaTemp05;
+--:-:-:-:1      FADD Ya06, Ya06, YaTemp06;
+--:-:-:-:1      FADD Ya07, Ya07, YaTemp07;
+--:-:-:-:1      FADD Ya08, Ya08, YaTemp08;
+--:-:-:-:1      FADD Ya09, Ya09, YaTemp09;
+
+--:-:-:-:1      FFMA Ya14, readSxB01.reuse, H00, Ya14;//2 1  0
+--:-:-:-:1      FFMA Ya15, readSxB01, H01, Ya15;      //3 1. 1
+
+--:-:-:-:1      FADD Ya10, Ya10, YaTemp10;
+--:-:-:-:1      FADD Ya11, Ya11, YaTemp11;
+--:-:-:-:1      FADD Ya12, Ya12, YaTemp12;
+--:-:-:-:1      FADD Ya13, Ya13, YaTemp13;
+--:-:-:-:1      FADD Ya14, Ya14, YaTemp14;
+
+--:-:-:-:6      FFMA Ya15, readSxB02, H00, Ya15;      //3 2  0
+--:-:-:-:3      FADD Ya15, Ya15, YaTemp15;
+
+//now we have 32*16=512 point conv result Y.
+//save Y to SM (reuse X space) (1/4 bandwidth used)
+--:1:-:-:1      STS.128 [writeYs + 4x<4*0>], Ya00;   // Wait Dep 1
+--:1:-:-:1      STS.128 [writeYs + 4x<4*1>], Ya04;   // Wait Dep 2
+--:1:-:-:1      STS.128 [writeYs + 4x<4*2>], Ya08;   // Wait Dep 3
+--:1:-:-:1      STS.128 [writeYs + 4x<4*3>], Ya12;   // Wait Dep 4
+
+//read back from SM
+01:-:-:-:1      LDS.U.128 Ya00, [readYs + 4x<128*0>];  //32*4=128
+--:-:2:-:1      LDS.U.128 Ya04, [readYs + 4x<128*1>];
+--:-:2:-:1      LDS.U.128 Ya08, [readYs + 4x<128*2>];
+--:-:2:-:1      LDS.U.128 Ya12, [readYs + 4x<128*3>];
+
+//save Y to GM
+//32*4vec4*=128  >> 128*4bytes
+02:-:-:-:1      STG.128 [writeYg + 4x<128*0>], Ya00;   // Wait Dep 1
+--:1:-:-:1      STG.128 [writeYg + 4x<128*1>], Ya04;   // Wait Dep 2
+--:1:-:-:1      STG.128 [writeYg + 4x<128*2>], Ya08;   // Wait Dep 3
+--:1:-:-:1      STG.128 [writeYg + 4x<128*3>], Ya12;   // Wait Dep 4
+
+
+--:-:-:-:f      EXIT;
+
+

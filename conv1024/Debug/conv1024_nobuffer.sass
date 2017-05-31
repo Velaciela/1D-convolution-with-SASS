@@ -1,0 +1,565 @@
+# Kernel: conv_kernel_128
+# Arch: sm_50
+# InsCnt:
+# RegCnt: 5
+# SharedSize: 16384
+# BarCnt: 0
+# Params(3):
+#   ord:addr:size:align
+#   0:0x140:4:0
+#   1:0x144:4:0
+#   2:0x148:4:0
+#
+# Instructions:
+
+<CONSTANT_MAPPING>
+    blockDimX : c[0x0][0x8]
+    blockDimY : c[0x0][0xc]
+    blockDimZ : c[0x0][0x10]
+    gridDimX : c[0x0][0x14]
+    gridDimY : c[0x0][0x18]
+    gridDimZ : c[0x0][0x1c]
+
+    param_0 : c[0x0][0x140]
+    param_1 : c[0x0][0x144]
+    param_2 : c[0x0][0x148]
+</CONSTANT_MAPPING>
+
+<REGISTER_MAPPING>
+
+
+    0-15  : H<00-15>
+    0-7   : readGh<00-07>
+
+    16-39 : X<00-23>
+    16-31 : Xtemp<00-15>
+    32-35 : readSxA<00-03>
+    36-39 : readSxB<00-03>
+
+    40-55 : Y<00-15>
+    57-71 : Ytemp<00-14>
+    56    : Ytemp15
+
+    72    : readHs
+    73    : readXs
+    74-76 : writeYg,writeYs,readYs
+
+    40-45 ~ tid,tid_3,tid_m16,tid_3m3072,tid_124,warp31
+    46-47 ~ bx,bx_m8192
+    48-49 ~ readHg,writeHs
+    50-51 ~ readXg,writeXs
+
+</REGISTER_MAPPING>
+
+//---------------------------------------------------------------------------------------------------------------------------
+
+--:-:1:-:1      S2R tid, SR_TID.X;
+--:-:2:-:1      S2R bx,  SR_CTAID.X;
+
+01:-:-:-:1      SHL tid_m16, tid, 4;                      //offset for tid vec4 operation       :    4*4bytes = 16
+02:-:-:-:1      SHL bx_m8192, bx, 13;                     //offset Xaddr for bx                 : 2048*4bytes = 8192
+
+--:-:-:-:6      LOP.AND tid_3, tid, 3;                    //for writeXs: in a 4-tid group . get [0 1 2 3 ]
+--:-:-:-:6      LOP.AND tid_124, tid, 124;                //for writeXs: divid 4 tid as a group . get [0 4 8 ... 120 124]
+--:-:-:-:6      SHR warp31, tid_124, 2;                   //get [0 1 2 3 4 ... 31]
+--:-:-:-:6      XMAD tid_3m3072, tid_3, 3072, RZ;         //32*vec4*4bytes*6times = 3072bytes/line (4lines total)
+
+//---------------------------------------------------------------------------------------------------------------------------
+
+//read H from GM
+--:-:-:-:6      MOV readHg, tid_m16;                      //addr_H + tid*4*4bytes
+--:-:-:-:6      IADD readHg, readHg, param_0;
+--:-:1:-:1      LDG.128 readGh00, [readHg + 4x<512*0>];   //1024 FP32 128*4=512 2 times
+--:-:1:-:1      LDG.128 readGh04, [readHg + 4x<512*1>];
+
+01:-:-:-:5      BAR.SYNC 0x0;
+
+//write H to SM
+--:-:-:-:6      MOV writeHs, tid_m16;                     //tid*4*4bytes
+--:-:-:-:6      IADD writeHs, writeHs, 12288;
+--:2:-:-:1      STS.128 [writeHs + 4x<512*0>], readGh00;
+--:2:-:-:1      STS.128 [writeHs + 4x<512*1>], readGh04;
+
+02:-:-:-:5      BAR.SYNC 0x0;
+
+//read H from SM
+--:-:-:-:6      MOV readHs, 16320;                        //begin at H0
+--:-:1:-:1      LDS.U.128 H00, [readHs + 4x<4*0>];        //all thread read same 16 H
+--:-:1:-:1      LDS.U.128 H04, [readHs + 4x<4*1>];
+--:-:1:-:1      LDS.U.128 H08, [readHs + 4x<4*2>];
+--:-:1:-:1      LDS.U.128 H12, [readHs + 4x<4*3>];
+
+//--------------------------------------------------------------------------------------------------------------------------
+
+//read X from GM
+--:-:-:-:6      MOV readXg, param_1;                      //+base addr_X
+--:-:-:-:6      IADD readXg, readXg, bx_m8192;            //offset Xaddr for bx : 2048*4bytes = 8192
+--:-:-:-:6      IADD readXg, readXg, tid_m16;             //vec4 * 4byte
+
+--:-:1:-:1      LDG.128 X00, [readXg + 4x<512*0>];        //1024 FP32 128*4=512 for 6 times
+--:-:1:-:1      LDG.128 X04, [readXg + 4x<512*1>];
+--:-:1:-:1      LDG.128 X08, [readXg + 4x<512*2>];
+--:-:1:-:1      LDG.128 X12, [readXg + 4x<512*3>];
+--:-:1:-:1      LDG.128 X16, [readXg + 4x<512*4>];
+--:-:1:-:1      LDG.128 X20, [readXg + 4x<512*5>];
+
+01:-:-:-:5      BAR.SYNC 0x0;
+
+//write X to SM
+--:-:-:-:6      ISCADD writeXs, warp31, tid_3m3072, 4;    //index , map thread data to SM : 3072*raw + warp*4*4bytes
+--:2:-:-:1      STS.128 [writeXs + 4x<128*0>], X00;       //+ 32*4*4bytes eache time : 512    >>> 4X<128*
+--:2:-:-:1      STS.128 [writeXs + 4x<128*1>], X04;       //(512*6=3072) (4lines*3072=12288)
+--:2:-:-:1      STS.128 [writeXs + 4x<128*2>], X08;       //|0|4|8|....|120|124||0|4|8|....|120|124|...
+--:2:-:-:1      STS.128 [writeXs + 4x<128*3>], X12;       //|1|5|9|....|121|125||1|5|9|....|121|125|...
+--:2:-:-:1      STS.128 [writeXs + 4x<128*4>], X16;       //|2|6|10|...|122|126||2|6|10|...|122|126|...
+--:2:-:-:1      STS.128 [writeXs + 4x<128*5>], X20;       //|3|7|11|...|123|127||3|7|11|...|123|127|...
+
+
+02:-:-:-:5      BAR.SYNC 0x0;
+
+//preload X from SM to Xtemp<00-15>
+--:-:-:-:6      MOV readXs, tid_m16;                      //tid_addr offset vec4 * 4byte * tid
+--:-:1:-:1      LDS.U.128 Xtemp00, [readXs + 4x<768*0>];  //readXs +=16 before next 4 raw loop load begin
+--:-:1:-:1      LDS.U.128 Xtemp04, [readXs + 4x<768*1>];
+--:-:1:-:1      LDS.U.128 Xtemp08, [readXs + 4x<768*2>];  //4x<32*vec4*6times  *  0/1/2/3>
+--:-:1:-:1      LDS.U.128 Xtemp12, [readXs + 4x<768*3>];
+
+01:-:-:-:5      BAR.SYNC 0x0;
+
+//--------------------------------------------------------------------------------------------------------------------------
+
+//writeYs ( reuse X's SM space )
+//16*4bytes=64 , 64*128 = 8192
+//+4x<4*4> each instruction
+//sm conflict but ok?  8/32 bandwidth used
+--:-:-:-:1      SHL writeYs, tid, 6;
+
+//readYs from SM
+//then [readYs + 4x<512 * (0 1 2 3)>] 4*128=512
+--:-:-:-:1      SHL readYs, tid, 4;
+
+//writeYg to GM
+//128*16=2048 2048*4bytes=8192
+//bx*8192 + tid * vec4 * 4byte
+//4 instruction: writeYg + 4x<512*0/1/2/3>
+--:-:-:-:6      ISCADD writeYg, tid, bx_m8192, 4;
+--:-:-:-:1      IADD writeYg, writeYg, param_2;
+
+//--------------------------------------------------------------------------------------------------------------------------
+
+//init Y
+--:-:-:-:1      MOV Y00, 0;
+--:-:-:-:1      MOV Y01, 0;
+--:-:-:-:1      MOV Y02, 0;
+--:-:-:-:1      MOV Y03, 0;
+--:-:-:-:1      MOV Y04, 0;
+--:-:-:-:1      MOV Y05, 0;
+--:-:-:-:1      MOV Y06, 0;
+--:-:-:-:1      MOV Y07, 0;
+--:-:-:-:1      MOV Y08, 0;
+--:-:-:-:1      MOV Y09, 0;
+--:-:-:-:1      MOV Y10, 0;
+--:-:-:-:1      MOV Y11, 0;
+--:-:-:-:1      MOV Y12, 0;
+--:-:-:-:1      MOV Y13, 0;
+--:-:-:-:1      MOV Y14, 0;
+--:-:-:-:1      MOV Y15, 0;
+
+--:-:-:-:1      MOV Ytemp00, 0;
+--:-:-:-:1      MOV Ytemp01, 0;
+--:-:-:-:1      MOV Ytemp02, 0;
+--:-:-:-:1      MOV Ytemp03, 0;
+--:-:-:-:1      MOV Ytemp04, 0;
+--:-:-:-:1      MOV Ytemp05, 0;
+--:-:-:-:1      MOV Ytemp06, 0;
+--:-:-:-:1      MOV Ytemp07, 0;
+--:-:-:-:1      MOV Ytemp08, 0;
+--:-:-:-:1      MOV Ytemp09, 0;
+--:-:-:-:1      MOV Ytemp10, 0;
+--:-:-:-:1      MOV Ytemp11, 0;
+--:-:-:-:1      MOV Ytemp12, 0;
+--:-:-:-:1      MOV Ytemp13, 0;
+--:-:-:-:1      MOV Ytemp14, 0;
+--:-:1:-:1      MOV Ytemp15, 0;
+
+
+//---------CALCU loop--------
+//offset Y
+TARGET1:
+01:-:-:Y:7      ISETP.GT.AND P0, PT, readHs, 12288, PT;
+--:-:-:-:6      IADD readXs, readXs, 16;                     //vec4 * 4bytes (next 16 FP32 data 16*4)
+--:-:-:-:1      IADD readHs, readHs, -64;                    //4*vec4*4bytes  : 16FP32 * 4
+//--:-:-:-:1      MOV readHs, 16320;
+
+--:-:2:-:1      LDS.U.128 readSxA00, [readXs + 4x<768*0>];
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<768*1>];   //4x<32*vec4*6times  *  0/1/2/3>
+
+//calcu Y
+--:-:-:-:1      FFMA Ytemp00, Xtemp03.reuse, H12, Ytemp00;
+--:-:-:-:1      FFMA Ytemp01, Xtemp03.reuse, H13, Ytemp01;
+--:-:-:-:1      FFMA Ytemp02, Xtemp03.reuse, H14, Ytemp02;
+--:-:-:-:1      FFMA Ytemp03, Xtemp03, H15, Ytemp03;
+
+--:-:-:-:1      FFMA Y00, Xtemp02.reuse, H13, Y00;
+--:-:-:-:1      FFMA Y01, Xtemp02.reuse, H14, Y01;
+--:-:-:-:6      FFMA Y02, Xtemp02, H15, Y02;
+
+--:-:-:-:1      FFMA Y00, Xtemp01.reuse, H14, Y00;
+--:-:-:-:6      FFMA Y01, Xtemp01, H15, Y01;
+
+--:-:-:-:6      FFMA Ytemp00, Xtemp00, H15, Ytemp00;
+
+//2
+--:-:-:-:1      FFMA Ytemp00, Xtemp07.reuse, H08, Ytemp00;
+--:-:-:-:1      FFMA Ytemp01, Xtemp07.reuse, H09, Ytemp01;
+--:-:-:-:1      FFMA Ytemp02, Xtemp07.reuse, H10, Ytemp02;
+--:-:-:-:1      FFMA Ytemp03, Xtemp07.reuse, H11, Ytemp03;
+--:-:-:-:1      FFMA Ytemp04, Xtemp07.reuse, H12, Ytemp04;
+--:-:-:-:1      FFMA Ytemp05, Xtemp07.reuse, H13, Ytemp05;
+--:-:-:-:1      FFMA Ytemp06, Xtemp07.reuse, H14, Ytemp06;
+--:-:-:-:1      FFMA Ytemp07, Xtemp07, H15, Ytemp07;
+
+--:-:-:-:1      FFMA Y00, Xtemp06.reuse, H09, Y00;
+--:-:-:-:1      FFMA Y01, Xtemp06.reuse, H10, Y01;
+--:-:-:-:1      FFMA Y02, Xtemp06.reuse, H11, Y02;
+--:-:-:-:1      FFMA Y03, Xtemp06.reuse, H12, Y03;
+--:-:-:-:1      FFMA Y04, Xtemp06.reuse, H13, Y04;
+--:-:-:-:1      FFMA Y05, Xtemp06.reuse, H14, Y05;
+--:-:-:-:1      FFMA Y06, Xtemp06, H15, Y06;
+
+--:-:-:-:1      FFMA Y00, Xtemp05.reuse, H10, Y00;//0 1 2
+--:-:-:-:1      FFMA Y01, Xtemp05.reuse, H11, Y01;
+--:-:-:-:1      FFMA Y02, Xtemp05.reuse, H12, Y02;
+--:-:-:-:1      FFMA Y03, Xtemp05.reuse, H13, Y03;
+--:-:-:-:1      FFMA Y04, Xtemp05.reuse, H14, Y04;
+--:-:-:-:6      FFMA Y05, Xtemp05, H15, Y05;
+
+--:-:-:-:1      FFMA Y02, Xtemp04.reuse, H13, Y02;//2 0 1
+--:-:-:-:1      FFMA Y00, Xtemp04.reuse, H11, Y00;//0 0 3
+--:-:-:-:1      FFMA Y01, Xtemp04.reuse, H12, Y01;//1 0 0
+--:-:-:-:1      FFMA Y03, Xtemp04.reuse, H14, Y03;//3 0 2
+--:-:-:-:1      FFMA Y04, Xtemp04, H15, Y04;//0 0 3
+
+//3
+--:-:-:-:1      FFMA Ytemp00, Xtemp11.reuse, H04, Ytemp00;
+--:-:-:-:1      FFMA Ytemp01, Xtemp11.reuse, H05, Ytemp01;
+--:-:-:-:1      FFMA Ytemp02, Xtemp11.reuse, H06, Ytemp02;
+--:-:-:-:1      FFMA Ytemp03, Xtemp11.reuse, H07, Ytemp03;
+--:-:-:-:1      FFMA Ytemp04, Xtemp11.reuse, H08, Ytemp04;
+--:-:-:-:1      FFMA Ytemp05, Xtemp11.reuse, H09, Ytemp05;
+--:-:-:-:1      FFMA Ytemp06, Xtemp11.reuse, H10, Ytemp06;
+--:-:-:-:1      FFMA Ytemp07, Xtemp11.reuse, H11, Ytemp07;
+--:-:-:-:1      FFMA Ytemp08, Xtemp11.reuse, H12, Ytemp08;
+--:-:-:-:1      FFMA Ytemp09, Xtemp11.reuse, H13, Ytemp09;
+--:-:-:-:1      FFMA Ytemp10, Xtemp11.reuse, H14, Ytemp10;
+--:-:-:-:1      FFMA Ytemp11, Xtemp11, H15, Ytemp11;
+
+--:-:-:-:1      FFMA Y00, Xtemp10.reuse, H05, Y00;//0 2  1
+--:-:-:-:1      FFMA Y01, Xtemp10.reuse, H06, Y01;//1 2. 2
+--:-:-:-:1      FFMA Y02, Xtemp10.reuse, H07, Y02;//2 2. 3
+--:-:-:-:1      FFMA Y03, Xtemp10.reuse, H08, Y03;//3 2. 0
+--:-:-:-:1      FFMA Y04, Xtemp10.reuse, H09, Y04;//0 2. 1
+--:-:-:-:1      FFMA Y05, Xtemp10.reuse, H10, Y05;//1 2. 2
+--:-:-:-:1      FFMA Y06, Xtemp10.reuse, H11, Y06;//2 2. 3
+--:-:-:-:1      FFMA Y07, Xtemp10.reuse, H12, Y07;//3 2. 0
+--:-:-:-:1      FFMA Y08, Xtemp10.reuse, H13, Y08;//0 2. 1
+--:-:-:-:1      FFMA Y09, Xtemp10.reuse, H14, Y09;//1 2. 2
+--:-:-:-:1      FFMA Y10, Xtemp10, H15, Y10;      //2 2. 3
+
+--:-:-:-:1      FFMA Y00, Xtemp09.reuse, H06, Y00;//0 1 2
+--:-:-:-:1      FFMA Y01, Xtemp09.reuse, H07, Y01;//1 1. 3
+--:-:-:-:1      FFMA Y02, Xtemp09.reuse, H08, Y02;//2 1. 0
+--:-:-:-:1      FFMA Y03, Xtemp09.reuse, H09, Y03;//3 1. 1
+--:-:-:-:1      FFMA Y04, Xtemp09.reuse, H10, Y04;//0 1. 2
+--:-:-:-:1      FFMA Y05, Xtemp09.reuse, H11, Y05;//1 1. 3
+--:-:-:-:1      FFMA Y06, Xtemp09.reuse, H12, Y06;//2 1. 0
+--:-:-:-:1      FFMA Y07, Xtemp09.reuse, H13, Y07;//3 1. 1
+--:-:-:-:1      FFMA Y08, Xtemp09.reuse, H14, Y08;//0 1. 2
+--:-:-:-:1      FFMA Y09, Xtemp09, H15, Y09;      //1 1. 3
+
+--:-:-:-:1      FFMA Y02, Xtemp08.reuse, H09, Y02;//2 0  1
+--:-:-:-:1      FFMA Y00, Xtemp08.reuse, H07, Y00;//0 0. 3
+--:-:-:-:1      FFMA Y01, Xtemp08.reuse, H08, Y01;//1 0. 0
+--:-:-:-:1      FFMA Y03, Xtemp08.reuse, H10, Y03;//3 0. 2
+--:-:-:-:1      FFMA Y04, Xtemp08.reuse, H11, Y04;//0 0. 3
+--:-:-:-:1      FFMA Y05, Xtemp08.reuse, H12, Y05;//1 0. 0
+--:-:-:-:1      FFMA Y06, Xtemp08.reuse, H13, Y06;//2 0. 1
+--:-:-:-:1      FFMA Y07, Xtemp08.reuse, H14, Y07;//3 0. 2
+--:-:-:-:1      FFMA Y08, Xtemp08, H15, Y08;      //0 0. 3
+
+//4
+--:-:-:-:1      FFMA Ytemp00, Xtemp15.reuse, H00, Ytemp00;// 1 3  0
+--:-:-:-:1      FFMA Ytemp01, Xtemp15.reuse, H01, Ytemp01;// 2 3. 1
+--:-:-:-:1      FFMA Ytemp02, Xtemp15.reuse, H02, Ytemp02;// 3 3. 2
+--:-:-:-:1      FFMA Ytemp03, Xtemp15.reuse, H03, Ytemp03;// 0 3. 3
+--:-:-:-:1      FFMA Ytemp04, Xtemp15.reuse, H04, Ytemp04;
+--:-:-:-:1      FFMA Ytemp05, Xtemp15.reuse, H05, Ytemp05;
+--:-:-:-:1      FFMA Ytemp06, Xtemp15.reuse, H06, Ytemp06;
+--:-:-:-:1      FFMA Ytemp07, Xtemp15.reuse, H07, Ytemp07;
+--:-:-:-:1      FFMA Ytemp08, Xtemp15.reuse, H08, Ytemp08;
+--:-:-:-:1      FFMA Ytemp09, Xtemp15.reuse, H09, Ytemp09;
+--:-:-:-:1      FFMA Ytemp10, Xtemp15.reuse, H10, Ytemp10;
+--:-:-:-:1      FFMA Ytemp11, Xtemp15.reuse, H11, Ytemp11;
+--:-:-:-:1      FFMA Ytemp12, Xtemp15.reuse, H12, Ytemp12;
+--:-:-:-:1      FFMA Ytemp13, Xtemp15.reuse, H13, Ytemp13;
+--:-:-:-:1      FFMA Ytemp14, Xtemp15.reuse, H14, Ytemp14;
+--:-:-:-:1      FFMA Ytemp15, Xtemp15, H15, Ytemp15;
+
+--:-:-:-:1      FFMA Y00, Xtemp14.reuse, H01, Y00;//0 2  1
+--:-:-:-:1      FFMA Y01, Xtemp14.reuse, H02, Y01;//1 2. 2
+--:-:-:-:1      FFMA Y02, Xtemp14.reuse, H03, Y02;//2 2. 3
+--:-:-:-:1      FFMA Y03, Xtemp14.reuse, H04, Y03;//3 2. 0
+--:-:-:-:1      FFMA Y04, Xtemp14.reuse, H05, Y04;//0 2. 1
+--:-:-:-:1      FFMA Y05, Xtemp14.reuse, H06, Y05;//1 2. 2
+--:-:-:-:1      FFMA Y06, Xtemp14.reuse, H07, Y06;//2 2. 3
+--:-:-:-:1      FFMA Y07, Xtemp14.reuse, H08, Y07;//3 2. 0
+--:-:-:-:1      FFMA Y08, Xtemp14.reuse, H09, Y08;//0 2. 1
+--:-:-:-:1      FFMA Y09, Xtemp14.reuse, H10, Y09;//1 2. 2
+--:-:-:-:1      FFMA Y10, Xtemp14.reuse, H11, Y10;//2 2. 3
+--:-:-:-:1      FFMA Y11, Xtemp14.reuse, H12, Y11;//3 2. 0
+--:-:-:-:1      FFMA Y12, Xtemp14.reuse, H13, Y12;//0 2. 1
+--:-:-:-:1      FFMA Y13, Xtemp14.reuse, H14, Y13;//1 2. 2
+--:-:-:-:1      FFMA Y14, Xtemp14, H15, Y14;      //2 2. 3
+
+--:-:-:-:1      FFMA Y00, Xtemp13.reuse, H02, Y00;//0 1  2
+--:-:-:-:1      FFMA Y01, Xtemp13.reuse, H03, Y01;//1 1. 3
+--:-:-:-:1      FFMA Y02, Xtemp13.reuse, H04, Y02;//2 1. 0
+--:-:-:-:1      FFMA Y03, Xtemp13.reuse, H05, Y03;//3 1. 1
+--:-:-:-:1      FFMA Y04, Xtemp13.reuse, H06, Y04;//0 1. 2
+--:-:-:-:1      FFMA Y05, Xtemp13.reuse, H07, Y05;//1 1. 3
+--:-:-:-:1      FFMA Y06, Xtemp13.reuse, H08, Y06;//2 1. 0
+--:-:-:-:1      FFMA Y07, Xtemp13.reuse, H09, Y07;//3 1. 1
+--:-:-:-:1      FFMA Y08, Xtemp13.reuse, H10, Y08;//0 1. 2
+--:-:-:-:1      FFMA Y09, Xtemp13.reuse, H11, Y09;//1 1. 3
+--:-:-:-:1      FFMA Y10, Xtemp13.reuse, H12, Y10;//2 1. 0
+--:-:-:-:1      FFMA Y11, Xtemp13.reuse, H13, Y11;//3 1. 1
+--:-:-:-:1      FFMA Y12, Xtemp13.reuse, H14, Y12;//0 1. 2
+--:-:-:-:1      FFMA Y13, Xtemp13, H15, Y13;      //1 1. 3
+
+--:-:-:-:1      FFMA Y02, Xtemp12.reuse, H05, Y02;//2 0. 1
+--:-:-:-:1      FFMA Y00, Xtemp12.reuse, H03, Y00;//0 0. 3
+--:-:-:-:1      FFMA Y01, Xtemp12.reuse, H04, Y01;//1 0. 0
+--:-:-:-:1      FFMA Y03, Xtemp12.reuse, H06, Y03;//3 0. 2
+--:-:-:-:1      FFMA Y04, Xtemp12.reuse, H07, Y04;//0 0. 3
+--:-:-:-:1      FFMA Y05, Xtemp12.reuse, H08, Y05;//1 0. 0
+--:-:-:-:1      FFMA Y06, Xtemp12.reuse, H09, Y06;//2 0. 1
+--:-:-:-:1      FFMA Y07, Xtemp12.reuse, H10, Y07;//3 0. 2
+--:-:-:-:1      FFMA Y08, Xtemp12.reuse, H11, Y08;//0 0. 3
+--:-:-:-:1      FFMA Y09, Xtemp12.reuse, H12, Y09;//1 0. 0
+--:-:-:-:1      FFMA Y10, Xtemp12.reuse, H13, Y10;//2 0. 1
+--:-:-:-:1      FFMA Y11, Xtemp12.reuse, H14, Y11;//3 0. 2
+--:-:-:-:1      FFMA Y12, Xtemp12, H15, Y12;      //0 0. 3
+
+//5
+02:-:-:-:1      FFMA Ytemp04, readSxA03.reuse, H00, Ytemp04; //1 3  0
+--:-:-:-:1      FFMA Ytemp05, readSxA03.reuse, H01, Ytemp05; //2 3. 1
+--:-:-:-:1      FFMA Ytemp06, readSxA03.reuse, H02, Ytemp06;
+--:-:-:-:1      FFMA Ytemp07, readSxA03.reuse, H03, Ytemp07;
+--:-:-:-:1      FFMA Ytemp08, readSxA03.reuse, H04, Ytemp08;
+--:-:-:-:1      FFMA Ytemp09, readSxA03.reuse, H05, Ytemp09;
+--:-:-:-:1      FFMA Ytemp10, readSxA03.reuse, H06, Ytemp10;
+--:-:-:-:1      FFMA Ytemp11, readSxA03.reuse, H07, Ytemp11;
+--:-:-:-:1      FFMA Ytemp12, readSxA03.reuse, H08, Ytemp12;
+--:-:-:-:1      FFMA Ytemp13, readSxA03.reuse, H09, Ytemp13;
+--:-:-:-:1      FFMA Ytemp14, readSxA03.reuse, H10, Ytemp14;
+--:-:-:-:1      FFMA Ytemp15, readSxA03, H11, Ytemp15;
+
+--:-:-:-:1      FFMA Y03, readSxA02.reuse, H00, Y03;//3 2  0
+--:-:-:-:1      FFMA Y04, readSxA02.reuse, H01, Y04;//0 2. 1
+--:-:-:-:1      FFMA Y05, readSxA02.reuse, H02, Y05;//1 2. 2
+--:-:-:-:1      FFMA Y06, readSxA02.reuse, H03, Y06;//2 2. 3
+--:-:-:-:1      FFMA Y07, readSxA02.reuse, H04, Y07;//3 2. 0
+--:-:-:-:1      FFMA Y08, readSxA02.reuse, H05, Y08;//0 2. 1
+--:-:-:-:1      FFMA Y09, readSxA02.reuse, H06, Y09;//1 2. 2
+--:-:-:-:1      FFMA Y10, readSxA02.reuse, H07, Y10;//2 2. 3
+--:-:-:-:1      FFMA Y11, readSxA02.reuse, H08, Y11;//3 2. 0
+--:-:-:-:1      FFMA Y12, readSxA02.reuse, H09, Y12;//0 2. 1
+--:-:-:-:1      FFMA Y13, readSxA02.reuse, H10, Y13;//1 2. 2
+--:-:-:-:1      FFMA Y14, readSxA02.reuse, H11, Y14;//2 2. 3
+--:-:-:-:1      FFMA Y15, readSxA02, H12, Y15;      //3 2. 0
+
+--:-:-:-:1      FFMA Y02, readSxA01.reuse, H00, Y02;//2 1  0
+--:-:-:-:1      FFMA Y03, readSxA01.reuse, H01, Y03;//3 1. 1
+--:-:-:-:1      FFMA Y04, readSxA01.reuse, H02, Y04;//0 1. 2
+--:-:-:-:1      FFMA Y05, readSxA01.reuse, H03, Y05;//1 1. 3
+--:-:-:-:1      FFMA Y06, readSxA01.reuse, H04, Y06;//2 1. 0
+--:-:-:-:1      FFMA Y07, readSxA01.reuse, H05, Y07;//3 1. 1
+--:-:-:-:1      FFMA Y08, readSxA01.reuse, H06, Y08;//0 1. 2
+--:-:-:-:1      FFMA Y09, readSxA01.reuse, H07, Y09;//1 1. 3
+--:-:-:-:1      FFMA Y10, readSxA01.reuse, H08, Y10;//2 1. 0
+--:-:-:-:1      FFMA Y11, readSxA01.reuse, H09, Y11;//3 1. 1
+--:-:-:-:1      FFMA Y12, readSxA01.reuse, H10, Y12;//0 1. 2
+--:-:-:-:1      FFMA Y13, readSxA01.reuse, H11, Y13;//1 1. 3
+--:-:-:-:1      FFMA Y14, readSxA01.reuse, H12, Y14;//2 1. 0
+--:-:-:-:1      FFMA Y15, readSxA01, H13, Y15;      //3 1. 1
+
+--:-:-:-:1      FFMA Y03, readSxA00.reuse, H02, Y03;//3 1  2
+--:-:-:-:1      FFMA Y01, readSxA00.reuse, H00, Y01;//1 1. 0
+--:-:-:-:1      FFMA Y02, readSxA00.reuse, H01, Y02;//2 1. 1
+--:-:-:-:1      FFMA Y04, readSxA00.reuse, H03, Y04;//0 1. 3
+--:-:-:-:1      FFMA Y05, readSxA00.reuse, H04, Y05;//1 1. 0
+--:-:-:-:1      FFMA Y06, readSxA00.reuse, H05, Y06;//2 1. 1
+--:-:-:-:1      FFMA Y07, readSxA00.reuse, H06, Y07;//3 1. 2
+--:-:-:-:1      FFMA Y08, readSxA00.reuse, H07, Y08;//0 1. 3
+--:-:-:-:1      FFMA Y09, readSxA00.reuse, H08, Y09;//1 1. 0
+--:-:-:-:1      FFMA Y10, readSxA00.reuse, H09, Y10;//2 1. 1
+--:-:-:-:1      FFMA Y11, readSxA00.reuse, H10, Y11;//3 1. 2
+--:-:-:-:1      FFMA Y12, readSxA00.reuse, H11, Y12;//0 1. 3
+--:-:-:-:1      FFMA Y13, readSxA00.reuse, H12, Y13;//1 1. 0
+--:-:-:-:1      FFMA Y14, readSxA00.reuse, H13, Y14;//2 1. 1
+--:-:-:-:1      FFMA Y15, readSxA00, H14, Y15;      //3 1. 2
+
+--:-:-:-:1      MOV Xtemp00, readSxA00;
+--:-:-:-:1      MOV Xtemp01, readSxA01;
+--:-:-:-:1      MOV Xtemp02, readSxA02;
+--:-:-:-:1      MOV Xtemp03, readSxA03;
+
+//6
+--:-:-:-:1      FFMA Ytemp08, readSxB03.reuse, H00, Ytemp08;
+--:-:-:-:1      FFMA Ytemp09, readSxB03.reuse, H01, Ytemp09;
+--:-:-:-:1      FFMA Ytemp10, readSxB03.reuse, H02, Ytemp10;
+--:-:-:-:1      FFMA Ytemp11, readSxB03.reuse, H03, Ytemp11;
+--:-:-:-:1      FFMA Ytemp12, readSxB03.reuse, H04, Ytemp12;
+--:-:-:-:1      FFMA Ytemp13, readSxB03.reuse, H05, Ytemp13;
+--:-:1:-:1      LDS.U.128 readSxA00, [readXs + 4x<768*2>];
+--:-:-:-:1      FFMA Ytemp14, readSxB03.reuse, H06, Ytemp14;
+--:-:-:-:1      FFMA Ytemp15, readSxB03, H07, Ytemp15;
+
+--:-:-:-:1      FFMA Y07, readSxB02.reuse, H00, Y07;//3 2. 0
+--:-:-:-:1      FFMA Y08, readSxB02.reuse, H01, Y08;//0 2. 1
+--:-:-:-:1      FFMA Y09, readSxB02.reuse, H02, Y09;//1 2. 2
+--:-:-:-:1      FFMA Y10, readSxB02.reuse, H03, Y10;//2 2. 3
+--:-:-:-:1      FFMA Y11, readSxB02.reuse, H04, Y11;//3 2. 0
+--:-:-:-:1      FFMA Y12, readSxB02.reuse, H05, Y12;//0 2. 1
+--:-:-:-:1      FFMA Y13, readSxB02.reuse, H06, Y13;//1 2. 2
+--:-:-:-:1      FFMA Y14, readSxB02.reuse, H07, Y14;//2 2. 3
+--:-:-:-:1      FFMA Y15, readSxB02, H08, Y15;      //3 2. 0
+
+--:-:-:-:1      FFMA Y06, readSxB01.reuse, H00, Y06;//2 1. 0
+--:-:-:-:1      FFMA Y07, readSxB01.reuse, H01, Y07;//3 1. 1
+--:-:-:-:1      FFMA Y08, readSxB01.reuse, H02, Y08;//0 1. 2
+--:-:-:-:1      FFMA Y09, readSxB01.reuse, H03, Y09;//1 1. 3
+--:-:-:-:1      FFMA Y10, readSxB01.reuse, H04, Y10;//2 1. 0
+--:-:-:-:1      FFMA Y11, readSxB01.reuse, H05, Y11;//3 1. 1
+--:-:-:-:1      FFMA Y12, readSxB01.reuse, H06, Y12;//0 1. 2
+--:-:-:-:1      FFMA Y13, readSxB01.reuse, H07, Y13;//1 1. 3
+--:-:-:-:1      FFMA Y14, readSxB01.reuse, H08, Y14;//2 1. 0
+--:-:-:-:1      FFMA Y15, readSxB01, H09, Y15;      //3 1. 1
+
+--:-:-:-:1      FFMA Y07, readSxB00.reuse, H02, Y07;//3 0  2
+--:-:-:-:1      FFMA Y05, readSxB00.reuse, H00, Y05;//1 0. 0
+--:-:-:-:1      FFMA Y06, readSxB00.reuse, H01, Y06;//2 0. 1
+--:-:-:-:1      FFMA Y08, readSxB00.reuse, H03, Y08;//0 0. 3
+--:-:-:-:1      FFMA Y09, readSxB00.reuse, H04, Y09;//1 0. 0
+--:-:-:-:1      FFMA Y10, readSxB00.reuse, H05, Y10;//2 0. 1
+--:-:-:-:1      FFMA Y11, readSxB00.reuse, H06, Y11;//3 0. 2
+--:-:-:-:1      FFMA Y12, readSxB00.reuse, H07, Y12;//0 0. 3
+--:-:-:-:1      FFMA Y13, readSxB00.reuse, H08, Y13;//1 0. 0
+--:-:-:-:1      FFMA Y14, readSxB00.reuse, H09, Y14;//2 0. 1
+--:-:-:-:1      FFMA Y15, readSxB00, H10, Y15;      //3 0. 2
+
+--:-:-:-:1      MOV Xtemp04, readSxB00;
+--:-:-:-:1      MOV Xtemp05, readSxB01;
+--:-:-:-:1      MOV Xtemp06, readSxB02;
+--:-:-:-:1      MOV Xtemp07, readSxB03;
+
+//7
+01:-:-:-:1      FFMA Ytemp12, readSxA03.reuse, H00, Ytemp12;
+--:-:-:-:1      FFMA Ytemp13, readSxA03.reuse, H01, Ytemp13;
+--:-:-:-:1      FFMA Ytemp14, readSxA03.reuse, H02, Ytemp14;
+--:-:-:-:4      FFMA Ytemp15, readSxA03, H03, Ytemp15;
+
+--:-:2:-:1      LDS.U.128 readSxB00, [readXs + 4x<768*3>];
+
+--:-:-:-:1      FFMA Y11, readSxA02.reuse, H00, Y11;//3 2. 0
+--:-:-:-:1      FFMA Y12, readSxA02.reuse, H01, Y12;//0 2. 1
+--:-:-:-:1      FFMA Y13, readSxA02.reuse, H02, Y13;//1 2. 2
+--:-:-:-:1      FFMA Y14, readSxA02.reuse, H03, Y14;//2 2. 3
+--:-:-:-:4      FFMA Y15, readSxA02, H04, Y15;      //3 2. 0
+
+--:-:-:-:1      FFMA Y10, readSxA01.reuse, H00, Y10;//2 1. 0
+--:-:-:-:1      FFMA Y11, readSxA01.reuse, H01, Y11;//3 1. 1
+--:-:-:-:1      FFMA Y12, readSxA01.reuse, H02, Y12;//0 1. 2
+--:-:-:-:1      FFMA Y13, readSxA01.reuse, H03, Y13;//1 1. 3
+--:-:-:-:1      FFMA Y14, readSxA01.reuse, H04, Y14;//2 1. 0
+--:-:-:-:1      FFMA Y15, readSxA01, H05, Y15;      //3 1. 1
+
+--:-:-:-:1      FFMA Y10, readSxA00.reuse, H01, Y10;//2 0. 1
+--:-:-:-:1      FFMA Y09, readSxA00.reuse, H00, Y09;//1 0. 0
+--:-:-:-:1      FFMA Y11, readSxA00.reuse, H02, Y11;//3 0. 2
+--:-:-:-:1      FFMA Y12, readSxA00.reuse, H03, Y12;//0 0. 3
+--:-:-:-:1      FFMA Y13, readSxA00.reuse, H04, Y13;//1 0. 0
+--:-:-:-:1      FFMA Y14, readSxA00.reuse, H05, Y14;//2 0. 1
+--:-:-:-:4      FFMA Y15, readSxA00, H06, Y15;      //3 0. 2
+
+--:-:-:-:1      MOV Xtemp08, readSxA00;
+--:-:-:-:1      MOV Xtemp09, readSxA01;
+--:-:-:-:1      MOV Xtemp10, readSxA02;
+--:-:-:-:1      MOV Xtemp11, readSxA03;
+
+//8
+02:-:-:-:1      FFMA Y15, readSxB00.reuse, H02, Y15;//3 0  2
+--:-:-:-:1      FFMA Y13, readSxB00.reuse, H00, Y13;//1 0. 0
+--:-:-:-:4      FFMA Y14, readSxB00, H01, Y14;      //2 0. 1
+
+--:-:-:-:1      MOV Xtemp12, readSxB00;
+--:-:-:-:1      MOV Xtemp13, readSxB01;
+--:-:-:-:1      MOV Xtemp14, readSxB02;
+--:-:-:-:1      MOV Xtemp15, readSxB03;
+
+--:-:-:-:1      FFMA Y14, readSxB01.reuse, H00, Y14;//2 1  0
+--:-:-:-:6      FFMA Y15, readSxB01, H01, Y15;      //3 1. 1
+
+--:-:-:-:6      FFMA Y15, readSxB02, H00, Y15;      //3 2  0
+
+
+--:-:1:-:1  @P0 LDS.U.128 H00, [readHs + 4x<4*0>];  //+4FP32*4bytes
+--:-:1:-:1  @P0 LDS.U.128 H04, [readHs + 4x<4*1>];
+--:-:1:-:1  @P0 LDS.U.128 H08, [readHs + 4x<4*2>];
+--:-:1:-:1  @P0 LDS.U.128 H12, [readHs + 4x<4*3>];
+
+01:-:-:-:5      BAR.SYNC 0x0;
+
+--:-:-:Y:5  @P0 BRA TARGET1;
+
+--:-:-:-:1      FADD Y00, Y00, Ytemp00;
+--:-:-:-:1      FADD Y01, Y01, Ytemp01;
+--:-:-:-:1      FADD Y02, Y02, Ytemp02;
+--:-:-:-:1      FADD Y03, Y03, Ytemp03;
+--:-:-:-:1      FADD Y04, Y04, Ytemp04;
+--:-:-:-:1      FADD Y05, Y05, Ytemp05;
+--:-:-:-:1      FADD Y06, Y06, Ytemp06;
+--:-:-:-:1      FADD Y07, Y07, Ytemp07;
+--:-:-:-:1      FADD Y08, Y08, Ytemp08;
+--:-:-:-:1      FADD Y09, Y09, Ytemp09;
+--:-:-:-:1      FADD Y10, Y10, Ytemp10;
+--:-:-:-:1      FADD Y11, Y11, Ytemp11;
+--:-:-:-:1      FADD Y12, Y12, Ytemp12;
+--:-:-:-:1      FADD Y13, Y13, Ytemp13;
+--:-:-:-:1      FADD Y14, Y14, Ytemp14;
+--:-:-:-:d      FADD Y15, Y15, Ytemp15;
+
+//save Y to SM (reuse X space) 16 bank conflict
+--:1:-:-:1      STS.128 [writeYs + 4x<4*0>], Y00;
+--:1:-:-:1      STS.128 [writeYs + 4x<4*1>], Y04;
+--:1:-:-:1      STS.128 [writeYs + 4x<4*2>], Y08;
+--:1:-:-:1      STS.128 [writeYs + 4x<4*3>], Y12;
+
+01:-:-:-:5      BAR.SYNC 0x0;
+
+//read back from SM
+--:-:2:-:1      LDS.U.128 Y00, [readYs + 4x<512*0>];  //128*4=512
+--:-:2:-:1      LDS.U.128 Y04, [readYs + 4x<512*1>];
+--:-:2:-:1      LDS.U.128 Y08, [readYs + 4x<512*2>];
+--:-:2:-:1      LDS.U.128 Y12, [readYs + 4x<512*3>];
+
+02:-:-:-:5      BAR.SYNC 0x0;
+
+//save Y to GM
+//128*4vec4*=512  >> 512*4bytes
+--:1:-:-:1      STG.128 [writeYg + 4x<512*0>], Y00;
+--:1:-:-:1      STG.128 [writeYg + 4x<512*1>], Y04;
+--:1:-:-:1      STG.128 [writeYg + 4x<512*2>], Y08;
+--:1:-:-:1      STG.128 [writeYg + 4x<512*3>], Y12;
+
+01:-:-:-:f      EXIT;

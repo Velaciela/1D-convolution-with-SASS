@@ -1,0 +1,18 @@
+﻿生成启动时间为 2016/10/23 21:38:50。
+     1>项目“F:\conv16\conv16\conv\conv.vcxproj”在节点 2 上(Build 个目标)。
+     1>Link:
+         D:\Program Files (x86)\Microsoft Visual Studio 12.0\VC\bin\link.exe /ERRORREPORT:PROMPT /OUT:"F:\conv16\conv16\Debug\conv.exe" /INCREMENTAL /NOLOGO /LIBPATH:"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\lib\Win32" cuda.lib cudart.lib kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib /MANIFEST /MANIFESTUAC:"level='asInvoker' uiAccess='false'" /manifest:embed /DEBUG /PDB:"F:\conv16\conv16\Debug\conv.pdb" /SUBSYSTEM:CONSOLE /TLBID:1 /DYNAMICBASE /NXCOMPAT /IMPLIB:"F:\conv16\conv16\Debug\conv.lib" /MACHINE:X86 Debug\conv16.cu.obj
+         conv.vcxproj -> F:\conv16\conv16\Debug\conv.exe
+       PostBuildEvent:
+         echo copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\bin\cudart*.dll" "F:\conv16\conv16\Debug\"
+         copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\bin\cudart*.dll" "F:\conv16\conv16\Debug\"
+         :VCEnd
+         copy "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\bin\cudart*.dll" "F:\conv16\conv16\Debug\"
+         C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\bin\cudart32_65.dll
+         C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v6.5\bin\cudart64_65.dll
+         已复制         2 个文件。
+     1>已完成生成项目“F:\conv16\conv16\conv\conv.vcxproj”(Build 个目标)的操作。
+
+生成成功。
+
+已用时间 00:00:00.81
